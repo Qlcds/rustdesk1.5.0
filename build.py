@@ -13,6 +13,7 @@ import re
 import subprocess
 import argparse
 import sys
+import json
 from pathlib import Path
 
 # Captured at import, while cwd is still the repo root: before Python 3.9 the main script's __file__
@@ -53,7 +54,6 @@ def system2(cmd):
     if exit_code != 0:
         sys.stderr.write(f"Error occurred when executing: `{cmd}`. Exiting.\n")
         sys.exit(-1)
-
 
 def get_version():
     with open("Cargo.toml", encoding="utf-8") as fh:
@@ -103,6 +103,74 @@ def parse_rc_features(feature):
     else:
         raise Exception(f'Unsupported features param {feature}')
 
+def download_flutter_deps_lockfile():
+    exit_code = os.system('flutter packages pub get --enforce-lockfile')
+    if exit_code != 0:
+        exit_code = os.system('flutter packages pub get')
+        if exit_code != 0:
+            sys.stderr.write("Error occurred when executing: `flutter packages pub get`. Exiting.\n")
+            sys.exit(-1)
+
+        sys.stderr.write("Error occurred when executing: `flutter packages pub get --enforce-lockfile`. Exiting.\n")
+        sys.stderr.write("\n")
+        sys.stderr.write("Contents of pubspec.lock after unprotected `flutter packages pub get`:\n")
+        sys.stderr.write("===================\n")
+
+        with open('pubspec.lock', 'rb') as f:
+            blob = f.read().decode('utf-8')
+            sys.stderr.write(blob)
+
+        sys.stderr.write("===================\n")
+        sys.exit(-1)
+
+def skip_pub_get_in_flutter_build(file_path: str = ".dart_tool/package_lock.json"):
+    """
+    Patches Flutter's `.dart_tool/package_file.json` to skip re-resolution
+    of packages inside `flutter build` without respecting the lockfile.
+    This is needed to prevent package hijacks.
+
+    basilgello: Unfortunately, doing only `flutter packages pub get --enforce-lockfile`
+    is not enough to prevent hijacks because `flutter build` calls another `dart pub get`
+    under the hood and we can not pass `--enforce-lockfile` to `flutter build` to make
+    it enforce the lockfile.
+
+    We can not pass `--no-pub` to `flutter build` either because it also disables
+    generation of flutter headers and causes weird CMake errors like
+    `missing flutter_generated.cmake`.
+
+    However, we can abuse the fact that `flutter build` skips unprotected `pub get`
+    entirely if package lockfile (`.dart_tool/package_lock.json`) was created by
+    the generator other than `pub`.
+
+    So we patch that file so `flutter build` skips unprotected package re-resolution.
+    """
+    if not os.path.exists(file_path):
+        sys.stderr.write(f"File not found: {file_path}. Exiting cleanly.")
+        return
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        sys.stderr.write(f"Error reading or parsing {file_path}: {e}. Exiting cleanly.")
+        return
+
+    if not isinstance(data, dict):
+        sys.stderr.write(f"Root elements of {file_path} is not a map. Exiting cleanly.")
+        return
+
+    if data.get("generator") == "pub":
+        data["generator"] = "pubForced"
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            print(f"Successfully updated 'generator' to 'pubForced' in {file_path}.")
+        except OSError as e:
+            sys.stderr.write(f"Failed to write modifications back to file: {e}")
+            sys.exit(1)
+    else:
+        print("The 'generator' key is either missing or its value is not 'pub'. No changes made.")
 
 def make_parser():
     parser = argparse.ArgumentParser(description='Build script.')
@@ -184,6 +252,7 @@ def generate_build_script_for_docker():
     with open("/tmp/build.sh", "w") as f:
         f.write('''
             #!/bin/bash
+            set -eo pipefail
             # environment
             export CPATH="$(clang -v 2>&1 | grep "Selected GCC installation: " | cut -d' ' -f4-)/include"
             # flutter
@@ -196,7 +265,49 @@ def generate_build_script_for_docker():
             dart pub global activate ffigen --version 5.0.1
             pushd /tmp && git clone https://github.com/SoLongAndThanksForAllThePizza/flutter_rust_bridge --depth=1 && popd
             pushd /tmp/flutter_rust_bridge/frb_codegen && cargo install --path . --locked && popd
-            pushd flutter && flutter pub get && popd
+            pushd flutter
+            if ! flutter packages pub get --enforce-lockfile; then
+              # basilgello: re-generate lockfile and abort the workflow with error
+              # to signal the devs that pubspec-bridge.lock differs from the
+              # generated one
+              flutter packages pub get
+              if ! git diff --quiet --exit-code "pubspec.lock"; then
+                echo "ERROR: Lockfile 'pubspec.lock' differs!"
+                echo ""
+                echo "Lockfile 'pubspec.lock' generated with 'pubspec.yaml'"
+                echo "differs from what we locked in the repository"
+                echo ""
+                echo "Please verify manually if the new dependencies are OK"
+                echo "and update the regenerated 'pubspec.lock' file"
+                echo "then commit and PR it!"
+                echo ""
+                echo "Contents of pubspec.lock:"
+                echo "=========================="
+                cat pubspec.lock
+                echo "=========================="
+                echo ""
+
+                exit 1
+              fi
+            fi
+            # basilgello: Unfortunately, this protection is not enough to prevent hijack
+            # because `flutter build` calls another `dart pub get` under the hood and we
+            # can not pass `--enforce-lockfile` to `flutter build` to make it enforce the
+            # lockfile.
+            #
+            # We can not pass `--no-pub` to `flutter build` either because it also disables
+            # generation of flutter headers and causes weird CMake errors like
+            # `missing flutter_generated.cmake`.
+            #
+            # However, we can abuse the fact that `flutter build` skips unprotected `pub get`
+            # entirely if package lockfile (`.dart_tool/package_lock.json`) was created by
+            # the generator other than `pub`.
+            #
+            # So we patch that file so `flutter build` skips unprotected package re-resolution.
+            if [ -f '.dart_tool/package_lock.json' ]; then
+              sed -i -e 's/"pub"/"pubForced"/' '.dart_tool/package_lock.json'
+            fi
+            popd
             ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart
             # install vcpkg
             pushd /opt
@@ -739,6 +850,8 @@ def build_flutter_deb(version, features):
         system2(f'cargo build --locked --features {features} --lib --release')
         ffi_bindgen_function_refactor()
     os.chdir('flutter')
+    download_flutter_deps_lockfile()
+    skip_pub_get_in_flutter_build()
     system2('flutter build linux --release')
     system2('mkdir -p tmpdeb/usr/bin/')
     system2('mkdir -p tmpdeb/usr/share/rustdesk')
@@ -944,6 +1057,8 @@ def build_flutter_dmg(version, features):
     # so the universal-by-default ARCHS_STANDARD doesn't try to link a missing slice.
     # FLUTTER_XCODE_* env vars are forwarded to xcodebuild as build settings.
     mac_arch = 'arm64' if platform.machine().lower() in ('arm64', 'aarch64') else 'x86_64'
+    system2(f'FLUTTER_XCODE_ARCHS={mac_arch} FLUTTER_XCODE_ONLY_ACTIVE_ARCH=YES flutter packages pub get --enforce-lockfile')
+    skip_pub_get_in_flutter_build()
     system2(
         f'FLUTTER_XCODE_ARCHS={mac_arch} FLUTTER_XCODE_ONLY_ACTIVE_ARCH=YES flutter build macos --release')
     system2('cp -rf ../target/release/service ./build/macos/Build/Products/Release/RustDesk.app/Contents/MacOS/')
@@ -960,6 +1075,8 @@ def build_flutter_arch_manjaro(version, features):
         system2(f'cargo build --locked --features {features} --lib --release')
     ffi_bindgen_function_refactor()
     os.chdir('flutter')
+    download_flutter_deps_lockfile()
+    skip_pub_get_in_flutter_build()
     system2('flutter build linux --release')
     system2(f'strip {flutter_build_dir}/lib/librustdesk.so')
     os.chdir('../res')
@@ -973,6 +1090,8 @@ def build_flutter_windows(version, features, skip_portable_pack):
             print("cargo build failed, please check rust source code.")
             exit(-1)
     os.chdir('flutter')
+    download_flutter_deps_lockfile()
+    skip_pub_get_in_flutter_build()
     system2('flutter build windows --release')
     os.chdir('..')
     shutil.copy2('target/release/deps/dylib_virtual_display.dll',

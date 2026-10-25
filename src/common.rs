@@ -1010,7 +1010,16 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
     }
 }
 
+/// Software update checking and installation are disabled in this build.
+#[inline]
+pub fn updates_disabled() -> bool {
+    true
+}
+
 pub fn check_software_update() {
+    if updates_disabled() {
+        return;
+    }
     if is_custom_client() {
         return;
     }

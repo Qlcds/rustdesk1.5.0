@@ -153,6 +153,9 @@ fn start_auto_update_check() -> Sender<UpdateMsg> {
 }
 
 fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
+    if crate::common::updates_disabled() {
+        return;
+    }
     std::thread::sleep(INITIAL_CHECK_DELAY);
     if let Err(e) = check_update(false) {
         log::error!("Error checking for updates: {}", e);
@@ -187,6 +190,9 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
 }
 
 fn check_update(manually: bool) -> ResultType<()> {
+    if crate::common::updates_disabled() {
+        return Ok(());
+    }
     // On macOS, auto-update is handled by check_update_as_root() in the service process.
     // The shared check_update() path is only used for manual update checks from the GUI.
     #[cfg(target_os = "macos")]
@@ -472,6 +478,9 @@ fn wait_for_failed_update_retry() {
 /// Called from `start_os_service()` which runs as root via LaunchDaemon.
 #[cfg(target_os = "macos")]
 pub fn start_auto_update_macos() {
+    if crate::common::updates_disabled() {
+        return;
+    }
     let spawn_result = std::thread::Builder::new()
         .name("rustdesk-auto-update".to_owned())
         .spawn(|| {
@@ -513,6 +522,9 @@ pub fn start_auto_update_macos() {
 
 #[cfg(target_os = "macos")]
 pub fn check_update_as_root() -> ResultType<bool> {
+    if crate::common::updates_disabled() {
+        return Ok(false);
+    }
     let _update_lock = acquire_mac_update_lock()?;
     // Allow-auto-update setting
     if !config::Config::get_bool_option(keys::OPTION_ALLOW_AUTO_UPDATE) {

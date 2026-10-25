@@ -626,6 +626,7 @@ jobs:
           files: |
             ./SignOutput/rustdesk-*.exe
 
+            
   build-rustdesk-ios:
     if: ${{ inputs.upload-artifact }}
     name: build rustdesk ios ipa
@@ -724,7 +725,7 @@ jobs:
           name: liblibrustdesk.a
           path: target/aarch64-apple-ios/release/liblibrustdesk.a
 
-      - name: Build rustdesk
+      - name: Build rustdesk archive
         shell: bash
         run: |
           pushd flutter
@@ -732,24 +733,31 @@ jobs:
           flutter clean
           # 获取依赖
           flutter pub get
-          # 构建 iOS（不签名）
+          # 构建 iOS archive（不签名，不导出 ipa）
           flutter build ipa --release --no-codesign
           popd
 
-      - name: Normalize IPA filename
+      - name: Create unsigned IPA from xcarchive
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p flutter/build/ios/ipa
-          # flutter build ipa 会生成 Runner.ipa 等文件，统一重命名为 rustdesk-<version>-ios.ipa
-          shopt -s nullglob
-          ipas=(flutter/build/ios/ipa/*.ipa)
-          if [ "${#ipas[@]}" -eq 0 ]; then
-            echo "::error::No IPA produced by flutter build ipa"
+          ARCHIVE_DIR="flutter/build/ios/archive"
+          APP_PATH="$ARCHIVE_DIR/Runner.xcarchive/Products/Applications/Runner.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::Runner.app not found in xcarchive at $APP_PATH"
+            echo "--- archive dir tree ---"
+            find "$ARCHIVE_DIR" -maxdepth 6 -type d 2>/dev/null || true
+            echo "--- flutter build dir tree ---"
+            find flutter/build/ios -maxdepth 6 -type d 2>/dev/null || true
             exit 1
           fi
-          mv "${ipas[0]}" "flutter/build/ios/ipa/rustdesk-${VERSION}-ios.ipa"
-          ls -lh "flutter/build/ios/ipa/rustdesk-${VERSION}-ios.ipa"
+          rm -rf flutter/build/ios/ipa
+          mkdir -p flutter/build/ios/ipa/Payload
+          cp -R "$APP_PATH" flutter/build/ios/ipa/Payload/
+          cd flutter/build/ios/ipa
+          zip -r "rustdesk-${VERSION}-ios.ipa" Payload/
+          rm -rf Payload
+          ls -lh "rustdesk-${VERSION}-ios.ipa"
 
       - name: Verify IPA exists
         shell: bash
@@ -758,6 +766,8 @@ jobs:
           if [ -f "$IPA" ]; then
             echo "✅ IPA file found: $IPA"
             ls -lh "$IPA"
+            # 简单校验 IPA 结构
+            unzip -l "$IPA" | grep -q "Payload/Runner.app/Info.plist" && echo "✅ IPA structure looks valid"
           else
             echo "❌ IPA file not found: $IPA"
             find flutter -name "*.ipa" 2>/dev/null || echo "No IPA files anywhere"

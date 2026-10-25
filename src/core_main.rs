@@ -36,6 +36,30 @@ fn finish_macos_update(result: hbb_common::ResultType<()>) -> Option<CoreMainAct
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn copy_service_config(args: &[String]) -> hbb_common::ResultType<()> {
+    if !crate::platform::is_root() {
+        hbb_common::bail!("Copying service configuration requires root privileges");
+    }
+    let [_, source, destination] = args else {
+        hbb_common::bail!("Expected source and destination service configuration paths");
+    };
+    #[cfg(target_os = "macos")]
+    {
+        if std::path::Path::new(destination) != config::Config2::file() {
+            hbb_common::bail!("Expected the system service configuration destination");
+        }
+        crate::trusted_devices::authority::register_service_authority()?;
+        if !std::path::Path::new(source).try_exists()? {
+            return Ok(());
+        }
+    }
+    crate::trusted_devices::service::copy_config(
+        std::path::Path::new(source),
+        std::path::Path::new(destination),
+    )
+}
+
 /// shared by flutter and sciter main function
 ///
 /// [Note]
@@ -217,6 +241,16 @@ pub fn core_main() -> Option<CoreMainAction> {
         }
         std::thread::spawn(move || crate::start_server(false, no_server));
     } else {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if args[0] == "--copy-service-config" {
+            if let Err(error) = copy_service_config(&args) {
+                log::error!("Failed to copy service configuration: {error}");
+                eprintln!("Failed to copy service configuration: {error}");
+                // The Linux Flutter runner treats a false core_main result as success.
+                std::process::exit(1);
+            }
+            return None;
+        }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         // Root CLI management commands must talk to the user `--server` main IPC.
         // Example: `sudo rustdesk --option custom-rendezvous-server` should query the
@@ -737,14 +771,14 @@ fn import_config(path: &str) {
     if get_modified_time(&path) > get_modified_time(&Config::file())
         && get_modified_time(&path) < get_exe_time()
     {
-        if store_path(Config::file(), config).is_err() {
-            log::info!("config written");
+        if let Err(error) = store_path(Config::file(), config) {
+            log::error!("Config import failed: {error}");
         }
     }
     let config2: Config2 = load_path(path2.into());
     if get_modified_time(&path2) > get_modified_time(&Config2::file()) {
-        if store_path(Config2::file(), config2).is_err() {
-            log::info!("config2 written");
+        if let Err(error) = store_path(Config2::file(), config2) {
+            log::error!("Config import failed: {error}");
         }
     }
 }

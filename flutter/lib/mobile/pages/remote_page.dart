@@ -28,6 +28,43 @@ import '../widgets/custom_scale_widget.dart';
 
 final initText = '1' * 1024;
 
+// Returns the edit that turns the typed text of [oldValue] into that of
+// [newValue]: how many characters to delete and the replacement text. The
+// hidden field keeps a run of '1' padding before the typed text, so the typed
+// tail starts after the leading '1's. Compared in code points so surrogate
+// pairs (e.g. emoji) are never split and each deleted character gets exactly
+// one backspace.
+({int backspaces, String newStr}) softKeyboardTextDiff(
+    String oldValue, String newValue) {
+  var i = 0;
+  while (i < oldValue.length && oldValue[i] == '1') {
+    ++i;
+  }
+  var j = 0;
+  while (j < newValue.length && newValue[j] == '1') {
+    ++j;
+  }
+  final oldRunes = oldValue.substring(i).runes.toList(growable: false);
+  final newRunes = newValue.substring(j).runes.toList(growable: false);
+  var common = 0;
+  for (;
+      common < oldRunes.length &&
+          common < newRunes.length &&
+          oldRunes[common] == newRunes[common];
+      ++common) {}
+  var backspaces = oldRunes.length - common;
+  // '1' padding past the end of the typed text acts as backspace credit: a
+  // consumed padding char means one remote backspace. A mass clear removes
+  // the whole run in one event but still means only one backspace.
+  if (backspaces == 0 && i > j) {
+    backspaces = 1;
+  }
+  return (
+    backspaces: backspaces,
+    newStr: String.fromCharCodes(newRunes.skip(common)),
+  );
+}
+
 // Workaround for Android (default input method, Microsoft SwiftKey keyboard) when using physical keyboard.
 // When connecting a physical keyboard, `KeyEvent.physicalKey.usbHidUsage` are wrong is using Microsoft SwiftKey keyboard.
 // https://github.com/flutter/flutter/issues/159384
@@ -377,37 +414,43 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       // clipboard
       oldValue = '';
     }
-    // This length-only diff assumes the IME appends at the end. If an IME
-    // leaves the caret inside paired punctuation, later insertions can replay
-    // the closing symbol: "()" -> "(a)" sends ")" instead of "a". This is a
-    // client text-diff issue, independent of the host keyboard layout.
-    if (newValue.length == oldValue.length) {
-      // ?
-    } else if (newValue.length < oldValue.length) {
-      final char = 'VK_BACK';
-      inputModel.inputKey(char);
-    } else {
-      final content = newValue.substring(oldValue.length);
-      if (content.length > 1) {
+    // Same diff algorithm as _handleIOSSoftKeyboardInput: a length-only diff
+    // misses in-place IME edits (e.g. Vietnamese Telex "oo" -> "ô"), so
+    // compare the typed tails after the '1' padding instead. Composing updates
+    // are sent too: a commit that produces the same text does not fire
+    // onChanged, so skipping them can leave the remote text behind.
+    final diff = softKeyboardTextDiff(oldValue, newValue);
+    var newStr = diff.newStr;
+
+    for (var i = 0; i < diff.backspaces; ++i) {
+      inputModel.inputKey('VK_BACK');
+    }
+
+    if (newStr.isNotEmpty) {
+      if (newStr.length > 1) {
         if (oldValue != '' &&
-            content.length == 2 &&
-            (content == '""' ||
-                content == '()' ||
-                content == '[]' ||
-                content == '<>' ||
-                content == "{}" ||
-                content == '”“' ||
-                content == '《》' ||
-                content == '（）' ||
-                content == '【】')) {
+            newStr.length == 2 &&
+            (newStr == '""' ||
+                newStr == '()' ||
+                newStr == '[]' ||
+                newStr == '<>' ||
+                newStr == "{}" ||
+                newStr == '”“' ||
+                newStr == '《》' ||
+                newStr == '（）' ||
+                newStr == '【】')) {
           // can not only input content[0], because when input ], [ are also auo insert, which cause ] never be input
-          bind.sessionInputString(sessionId: sessionId, value: content);
+          bind.sessionInputString(sessionId: sessionId, value: newStr);
           _openKeyboardUnlocked();
           return;
         }
-        bind.sessionInputString(sessionId: sessionId, value: content);
+        bind.sessionInputString(sessionId: sessionId, value: newStr);
+      } else if (newStr.codeUnitAt(0) > 127) {
+        // A single non-ASCII char (e.g. a composed Vietnamese letter) cannot be
+        // sent as a raw key code; send it as a unicode string instead.
+        bind.sessionInputString(sessionId: sessionId, value: newStr);
       } else {
-        inputChar(content);
+        inputChar(newStr);
       }
     }
   }
